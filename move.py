@@ -1,20 +1,5 @@
 #!/usr/bin/env python3
 """
-moza_drive.py - make a MOZA wheel base turn itself to positions / torques you command.
-
-Uses the standard Linux force-feedback (evdev) interface exposed by the in-kernel
-hid-universal-pidff driver, so no MOZA-specific protocol is needed.
-
-How it works:
-  * Reads the wheel's current angle from the steering axis (ABS_X).
-  * Runs a PD (spring + damper) control loop at ~500 Hz and sends the result to the
-    base as a continuously updated FF_CONSTANT force effect.
-  * Commands come from stdin (interactive) or from Python if you import WheelController.
-
-Requirements:
-  pip install evdev
-  Read/write access to the wheel's /dev/input/event* node (see udev rule in the notes).
-
 Interactive commands:
   <number>        go to that angle in degrees (0 = center, + = right, - = left)
   t <value>       apply raw torque, -1.0 .. 1.0 (scaled by --max-torque)
@@ -22,8 +7,6 @@ Interactive commands:
   pos             print current angle
   q               quit
 
-SAFETY: a direct-drive base can spin hard. Keep hands and cables clear, start with a
-low --max-torque, and set a sane rotation range/power limit in Boxflat first.
 """
 
 import argparse
