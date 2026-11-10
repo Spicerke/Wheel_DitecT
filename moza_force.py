@@ -39,6 +39,10 @@ import numpy as np
 
 from moza_drive import WheelController, find_moza
 
+if not hasattr(WheelController, "set_model"):
+    raise SystemExit("moza_drive.py next to this script is an old version. Replace it with the "
+                     "latest moza_drive.py (the one that contains 'human_torque').")
+
 MODEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moza_model.json")
 
 
@@ -60,6 +64,9 @@ def excite(ctl, seconds, amp_deg):
 
 def fit_model(log):
     """Least-squares fit of motor = J*accel + b*vel + fc*sign(vel) (no human touching)."""
+    if len(log) < 500:
+        raise SystemExit(f"Calibration recorded only {len(log)} samples. Make sure moza_drive.py "
+                         "is the latest version (it must contain 'human_torque').")
     t, pos, _, motor = np.array(log).T
     k = np.ones(11) / 11
     vel = np.convolve(np.gradient(pos, t), k, "same")
