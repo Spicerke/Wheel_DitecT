@@ -1,4 +1,32 @@
 #!/usr/bin/env python3
+"""
+moza_force.py - turn the wheel by hand, read the torque you're applying.
+
+MOZA bases have no torque sensor the PC can read, so the force is estimated from how the
+wheel moves: torque = inertia * acceleration + damping * velocity + friction
+(plus whatever the motor is doing, which we know because we command it).
+
+The inertia/damping/friction of YOUR wheel + rim are measured once, automatically:
+the first run spins the wheel back and forth by itself for ~20 s (hands off!) and saves
+the result to moza_model.json. After that it goes straight to reading.
+
+Modes:
+  default   wheel is free (motor off). You feel nothing; readings come from motion,
+            so holding the wheel still and pushing reads ~0.
+  --hold    a soft spring holds the wheel where it starts, so pushing against it
+            without moving much still gives a reading.
+
+The same estimate is available in code as WheelController.human_torque, so it keeps
+working when an algorithm is driving the wheel with ctl.goto().
+
+Examples:
+  python3 moza_force.py --peak-nm 5.5            # R5, print Nm
+  python3 moza_force.py --hold --csv log.csv     # resist, and log to CSV
+  python3 moza_force.py --recalibrate            # redo the model (e.g. new rim)
+
+Requires: pip install evdev numpy, and moza_drive.py in the same folder.
+"""
+
 import argparse
 import csv
 import json
@@ -19,7 +47,10 @@ def excite(ctl, seconds, amp_deg):
     parts = [(0.3, 1.0), (0.7, 0.5), (1.3, 0.25), (2.1, 0.12)]   # (Hz, weight)
     scale = amp_deg / sum(w for _, w in parts)
     t0 = time.monotonic()
-    while (t := time.monotonic() - t0) < seconds:
+    while True:
+        t = time.monotonic() - t0
+        if t >= seconds:
+            break
         ctl.goto(scale * sum(w * math.sin(2 * math.pi * f * t + i)
                              for i, (f, w) in enumerate(parts)))
         time.sleep(0.005)
