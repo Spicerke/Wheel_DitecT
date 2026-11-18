@@ -42,7 +42,7 @@
   .senslabel span:last-child { color: var(--text); }
   .sensrow { display: flex; align-items: center; gap: 6px; }
   .sensrow small { color: var(--dim); font-size: 10px; }
-  #lock { flex: 1; direction: rtl; }   /* right = smaller lock angle = more sensitive */
+  #ratio { flex: 1; direction: rtl; }   /* right = lower ratio = more sensitive */
   #wheeltext { text-align: center; font-size: 15px; margin: 2px 0 6px; font-variant-numeric: tabular-nums; }
   #wheeltext small { display: block; color: var(--dim); font-size: 11px; }
 </style>
@@ -67,7 +67,7 @@
     <div id="sensctl">
       <div class="senslabel"><span>sensitivity</span><span id="ratiov">—</span></div>
       <div class="sensrow"><small>less</small>
-        <input id="lock" type="range" step="10" title="wheel degrees for full road-wheel lock">
+        <input id="ratio" type="range" step="0.5" title="steering ratio: wheel deg per road-wheel deg">
         <small>more</small></div>
     </div>
     <div id="manualctl" hidden>
@@ -238,10 +238,10 @@ function updatePanel() {
     $("mspeed").value = s.manual_speed;
   }
   prevMode = s.mode;
-  const lk = $("lock");
-  if (lk.min != s.lock_min || lk.max != s.lock_max) { lk.min = s.lock_min; lk.max = s.lock_max; }
-  if (document.activeElement !== lk && Date.now() - lockSentAt > 1000) lk.value = s.wheel_limit;
-  $("ratiov").textContent = `${f(s.ratio, 1)}:1 · lock ${f(s.wheel_limit, 0, "°")}`;
+  const rs = $("ratio");
+  if (rs.min != s.ratio_min || rs.max != s.ratio_max) { rs.min = s.ratio_min; rs.max = s.ratio_max; }
+  if (document.activeElement !== rs && Date.now() - ratioSentAt > 1000) rs.value = s.ratio;
+  $("ratiov").textContent = `${f(s.ratio, 1)}:1`;
   $("manualctl").hidden = s.mode !== "MANUAL";
   $("wheelviz").classList.toggle("grab", s.mode === "MANUAL");
   $("mspeedv").textContent = f(s.manual_speed, 1, " m/s");
@@ -329,8 +329,8 @@ wv.addEventListener("pointermove", e => {
 });
 for (const ev of ["pointerup", "pointercancel"]) wv.addEventListener(ev, () => { dragging = false; });
 $("mspeed").addEventListener("input", e => setSpeed(Number(e.target.value)));
-let lockSentAt = 0;
-$("lock").addEventListener("input", e => { lockSentAt = Date.now(); send({cmd: "lock", deg: Number(e.target.value)}); });
+let ratioSentAt = 0;
+$("ratio").addEventListener("input", e => { ratioSentAt = Date.now(); send({cmd: "ratio", ratio: Number(e.target.value)}); });
 $("reset").onclick = () => { trail = []; send({cmd: "reset"}); };
 addEventListener("keydown", e => {
   if (e.code === "Space") { e.preventDefault(); send({cmd: "stop"}); return; }

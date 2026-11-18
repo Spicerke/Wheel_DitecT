@@ -43,7 +43,7 @@ from planner import GridMap, init_worker, plan_path
 from tracker import PurePursuit, SlewLimiter
 from vehicle import Bicycle, Pose, Steering
 
-LOCK_MIN = 90.0                                  # most sensitive: full lock at 90 deg
+RATIO_MIN, RATIO_MAX = 3.0, 20.0                 # steering-ratio range for the UI slider
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_FILE = os.path.join(HERE, "moza_model.json")
 DRIVING = ("AUTO", "OVERRIDE", "REPLANNING")
@@ -56,11 +56,7 @@ class Autopilot:
         self.ctl, self.grid, self.plan_grid = ctl, grid, plan_grid
         self.cfg, self.hub, self.pool, self.detector = cfg, hub, pool, detector
         self.full_torque = ctl.max_torque
-        self.lock_max = ctl.rotation / 2.0           # can't steer past the Boxflat range
-        lock = min(cfg.wheel_lock, self.lock_max)
-        if lock < cfg.wheel_lock:
-            print(f"--wheel-lock {cfg.wheel_lock:.0f} exceeds the Boxflat range; using {lock:.0f}")
-        self.steering = Steering(2.0 * lock, cfg.max_steer)
+        self.steering = Steering(cfg.steer_ratio, cfg.max_steer, ctl.rotation / 2.0)
         self.car = Bicycle(cfg.wheelbase)
         sx, sy = grid.start or (grid.cols * grid.res / 2, grid.rows * grid.res / 2)
         self.start_pose = Pose(sx, sy, math.radians(cfg.start_yaw))
@@ -118,14 +114,12 @@ class Autopilot:
     def _request_plan(self):
         self._future = self.pool.submit(plan_path, (self.pose.x, self.pose.y), self.goal)
 
-    def set_wheel_lock(self, deg):
-        """Change steering sensitivity live: wheel degrees each way for full road-wheel lock."""
-        if not math.isfinite(deg):
+    def set_ratio(self, ratio):
+        """Change steering sensitivity live (wheel deg per road-wheel deg). Nothing else."""
+        if not math.isfinite(ratio):
             return
-        deg = max(LOCK_MIN, min(self.lock_max, deg))
-        self.steering = Steering(2.0 * deg, self.cfg.max_steer)
-        self.manual_deg = max(-deg, min(deg, self.manual_deg))
-        self.msg = f"steering ratio {self.steering.ratio:.1f}:1 (full lock at {deg:.0f} deg)"
+        self.steering.ratio = max(RATIO_MIN, min(RATIO_MAX, ratio))
+        self.msg = f"steering ratio {self.steering.ratio:.1f}:1"
 
     def _start_wheel(self):
         """Hand the wheel to the motor gently: start from where it is, ramp torque up."""
@@ -214,8 +208,8 @@ class Autopilot:
                     v = float(c["v"])
                     if math.isfinite(v):
                         self.manual_speed = max(0.0, min(2.0 * self.cfg.speed + 2.0, v))
-                elif kind == "lock":
-                    self.set_wheel_lock(float(c["deg"]))
+                elif kind == "ratio":
+                    self.set_ratio(float(c["ratio"]))
                 elif kind == "reset":
                     self.stop("reset")
                     self.pose = Pose(**vars(self.start_pose))
@@ -292,8 +286,8 @@ class Autopilot:
             "yaw": round(self.pose.yaw, 4), "steer": round(steer_actual, 4),
             "speed": speed, "wheel": round(angle, 1),
             "wheel_limit": self.steering.wheel_limit, "manual_speed": self.manual_speed,
-            "ratio": round(self.steering.ratio, 2), "lock_min": LOCK_MIN,
-            "lock_max": self.lock_max,
+            "ratio": round(self.steering.ratio, 2), "ratio_min": RATIO_MIN,
+            "ratio_max": RATIO_MAX,
             "target": None if target is None else round(target, 1),
             "vel": round(vel, 1), "torque": round(d.filtered, 4),
             "enter": d.torque_enter, "exit": d.torque_exit,
@@ -344,9 +338,9 @@ def main():
     # car
     a("--speed", type=float, default=2.0, help="car speed, m/s")
     a("--wheelbase", type=float, default=2.7)
-    a("--max-steer", type=float, default=30.0, help="road-wheel lock, deg")
-    a("--wheel-lock", type=float, default=360.0,
-      help="steering-wheel angle each way at full road-wheel lock, deg (sets the ratio)")
+    a("--max-steer", type=float, default=30.0, help="car's road-wheel lock, deg")
+    a("--steer-ratio", type=float, default=12.0,
+      help="steering ratio, wheel deg per road-wheel deg (lower = more sensitive)")
     a("--lookahead", type=float, default=4.0, help="min pure-pursuit lookahead, m")
     a("--lookahead-gain", type=float, default=1.0, help="lookahead per m/s")
     a("--goal-tol", type=float, default=1.0, help="arrival radius, m")

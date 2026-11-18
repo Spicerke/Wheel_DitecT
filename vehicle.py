@@ -6,8 +6,8 @@ All unit/sign conversions live here so nothing else has to think about them:
   Road wheel  : steer angle in radians, positive = turning left (counter-clockwise).
   Steering wh.: degrees, positive = right (same as WheelController.angle()).
 
-Full steering-wheel lock maps to full road-wheel lock, so the steering ratio follows from
-the lock-to-lock range passed in (e.g. 720 deg / 2 / 30 deg max steer -> 12:1).
+wheel angle = road-wheel angle * ratio. The only limits are physical: the car's road-wheel
+lock (max_steer) and how far the wheel base can turn (wheel_limit, the Boxflat range).
 """
 
 import math
@@ -22,10 +22,10 @@ class Pose:
 
 
 class Steering:
-    def __init__(self, lock_to_lock_deg, max_steer_deg=30.0):
+    def __init__(self, ratio, max_steer_deg=30.0, wheel_limit_deg=450.0):
+        self.ratio = ratio
         self.max_steer = math.radians(max_steer_deg)
-        self.wheel_limit = lock_to_lock_deg / 2.0
-        self.ratio = self.wheel_limit / max_steer_deg
+        self.wheel_limit = wheel_limit_deg
 
     def wheel_to_steer(self, wheel_deg):
         s = -math.radians(wheel_deg / self.ratio)
@@ -33,7 +33,8 @@ class Steering:
 
     def steer_to_wheel(self, steer_rad):
         s = max(-self.max_steer, min(self.max_steer, steer_rad))
-        return -math.degrees(s) * self.ratio
+        w = -math.degrees(s) * self.ratio
+        return max(-self.wheel_limit, min(self.wheel_limit, w))
 
 
 class Bicycle:
