@@ -26,6 +26,7 @@ SAFETY: the wheel will turn by itself. Start with a low --max-torque.
 """
 
 import argparse
+import csv
 import json
 import math
 import multiprocessing
@@ -72,6 +73,7 @@ class Autopilot:
         self._loop_worst = 0.0
         self._timing = (0.0, 0.0)
         self._timing_t = 0.0
+        self.log = None                              # csv.writer, set by main()
 
     # ---------- state changes ----------
     def _set(self, state, msg=None):
@@ -164,18 +166,23 @@ class Autopilot:
 
         if self.state == "AUTO":
             err = angle - self.slew.value if self._ramp_done else 0.0
-            if self.detector.takeover(ht, err, dt):
+            if self.cfg.override and self.detector.takeover(ht, err, dt):
                 ctl.release()
                 ctl.max_torque = self.full_torque
                 self.overrides += 1
                 self.detector.reset()
-                self._set("OVERRIDE", "human steering")
+                self._set("OVERRIDE", "human steering: " + self.detector.reason)
             else:
                 steer, self.info = self.tracker.update(self.pose, self.cfg.speed)
                 if self.info["remaining"] < self.cfg.goal_tol:
                     self.stop("arrived")
                 else:
                     target = self.slew.step(self.steering.steer_to_wheel(steer), dt)
+                    if not self._ramp_done:
+                        # Motor is still weak: keep the command on a short leash to the wheel
+                        # so lag can't pile up and get released as a lunge (or a false takeover).
+                        target = max(angle - 20.0, min(angle + 20.0, target))
+                        self.slew.reset(target)
                     ctl.goto(target)
                     if not self._ramp_done:
                         ctl.max_torque = min(self.full_torque, ctl.max_torque
@@ -200,6 +207,12 @@ class Autopilot:
             self._loop_worst, self._timing_t = 0.0, now
 
         d = self.detector
+        if self.log:
+            self.log.writerow([f"{now:.3f}", self.state, f"{angle:.2f}",
+                               "" if target is None else f"{target:.2f}", f"{vel:.1f}",
+                               f"{ht:.5f}", f"{d.filtered:.5f}", f"{ctl.last_output:.4f}",
+                               f"{ctl.max_torque:.3f}", f"{self.pose.x:.2f}",
+                               f"{self.pose.y:.2f}"])
         self.hub.add_sample([round(now, 3), round(angle, 1),
                              None if target is None else round(target, 1),
                              round(d.filtered, 4), MODE_CODE[self.state]])
@@ -239,7 +252,12 @@ def build_detector(args, model):
     if model:
         enter = enter if enter is not None else max(5 * noise, 0.03)
         exit_ = exit_ if exit_ is not None else max(2 * noise, 0.015)
-    return OverrideDetector(enter, exit_, angle_enter_deg=args.takeover_angle,
+    angle = args.takeover_angle
+    if angle is None:
+        angle = None if model else 45.0          # with a model, hand torque is the signal
+    elif angle <= 0:
+        angle = None
+    return OverrideDetector(enter, exit_, angle_enter_deg=angle,
                             enter_s=args.takeover_time, exit_s=args.release_time)
 
 
@@ -270,14 +288,19 @@ def main():
       help="max commanded wheel speed, deg/s (too low makes tracking oscillate)")
     a("--ramp", type=float, default=0.5, help="seconds to ramp motor torque on engage")
     # override
+    a("--override", action="store_true",
+      help="enable human-takeover detection (off by default: hands-off driving only)")
     a("--takeover-torque", type=float, help="human torque to take over (default 5x noise)")
     a("--release-torque", type=float, help="human torque counted as hands-off (default 2x noise)")
-    a("--takeover-angle", type=float, default=45.0, help="wheel-vs-command error to take over, deg")
+    a("--takeover-angle", type=float,
+      help="wheel-vs-command error to take over, deg (default: off with a wheel model, "
+           "45 without; 0 = off)")
     a("--takeover-time", type=float, default=0.12, help="s the takeover signal must persist")
     a("--release-time", type=float, default=0.6, help="s of hands-off before replanning")
     # ui
     a("--host", default="127.0.0.1")
     a("--port", type=int, default=8080)
+    a("--log", help="write a 50 Hz CSV (angle, command, torques, mode...) for tuning")
     args = ap.parse_args()
 
     grid = GridMap.load(args.map, args.resolution)
@@ -310,7 +333,12 @@ def main():
     threading.Thread(target=ctl.run, daemon=True).start()
 
     detector = build_detector(args, model)
-    print(f"takeover torque {detector.torque_enter}, release torque {detector.torque_exit}")
+    if not args.override:
+        print("human takeover: OFF (pass --override to enable)")
+    fmt = lambda v: "off" if v is None else f"{v * 100:.1f}% FS"
+    print(f"takeover: torque {fmt(detector.torque_enter)}, angle "
+          f"{'off' if detector.angle_enter is None else f'{detector.angle_enter:.0f} deg'}; "
+          f"release torque {fmt(detector.torque_exit)}")
 
     hub = DebugHub({"rows": grid.rows, "cols": grid.cols, "res": grid.res,
                     "occ": grid.to_rows(), "inflated": plan_grid.to_rows(),
@@ -320,6 +348,12 @@ def main():
           f":{args.port}")
 
     pilot = Autopilot(ctl, grid, plan_grid, args, hub, pool, detector)
+    log_fh = None
+    if args.log:
+        log_fh = open(args.log, "w", newline="")
+        pilot.log = csv.writer(log_fh)
+        pilot.log.writerow(["t", "mode", "angle", "command", "vel_dps", "human_torque",
+                            "human_torque_filt", "motor_out", "torque_scale", "x", "y"])
     if args.go and grid.goal:
         pilot.set_goal(*grid.goal)
     try:
@@ -328,6 +362,8 @@ def main():
         pass
     finally:
         ctl.stop()
+        if log_fh:
+            log_fh.close()
         srv.shutdown()
         pool.shutdown(wait=False, cancel_futures=True)
         print("\nReleased.")

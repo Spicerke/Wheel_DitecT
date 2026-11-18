@@ -32,8 +32,9 @@
   td:first-child { color: var(--dim); }
   h3 { margin: 10px 0 4px; font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
   .hint { color: var(--dim); font-size: 11px; margin-top: 10px; }
-  .chart-label { color: var(--dim); font-size: 11px; margin: 8px 0 2px; }
-  .key { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin: 0 4px 0 10px; }
+  #wheelviz { width: 100%; aspect-ratio: 1; border: none; }
+  #wheeltext { text-align: center; font-size: 15px; margin: 2px 0 6px; font-variant-numeric: tabular-nums; }
+  #wheeltext small { display: block; color: var(--dim); font-size: 11px; }
 </style>
 </head>
 <body>
@@ -47,17 +48,11 @@
 <main>
   <div>
     <canvas id="map"></canvas>
-    <div class="chart-label">wheel angle (deg)
-      <span class="key" style="background:var(--car)"></span>actual
-      <span class="key" style="background:var(--path)"></span>commanded</div>
-    <canvas id="angle" height="110"></canvas>
-    <div class="chart-label">human torque (% full scale)
-      <span class="key" style="background:var(--override)"></span>estimate
-      <span class="key" style="background:var(--bad)"></span>takeover
-      <span class="key" style="background:var(--goal)"></span>release</div>
-    <canvas id="torque" height="110"></canvas>
   </div>
   <aside>
+    <h3>Wheel (commanded)</h3>
+    <canvas id="wheelviz"></canvas>
+    <div id="wheeltext"></div>
     <h3>Car</h3>
     <table>
       <tr><td>pose</td><td id="pose">—</td></tr>
@@ -72,9 +67,7 @@
       <tr><td>angle</td><td id="wheel">—</td></tr>
       <tr><td>commanded</td><td id="target">—</td></tr>
       <tr><td>velocity</td><td id="vel">—</td></tr>
-      <tr><td>human torque</td><td id="torque_v">—</td></tr>
       <tr><td>motor scale</td><td id="tscale">—</td></tr>
-      <tr><td>overrides</td><td id="overrides">—</td></tr>
     </table>
     <h3>Planner</h3>
     <table>
@@ -98,8 +91,7 @@ const MODE_COLOR = {IDLE: C.idle, PLANNING: C.plan, AUTO: C.auto, OVERRIDE: C.ov
 const MODE_BY_CODE = ["IDLE","PLANNING","AUTO","OVERRIDE","REPLANNING"];
 const $ = id => document.getElementById(id);
 
-let map = null, mapImg = null, path = [], state = null, trail = [], samples = [];
-const WINDOW_S = 15;
+let map = null, mapImg = null, path = [], state = null, trail = [];
 
 function sizeCanvas(cv, cssH) {
   const dpr = window.devicePixelRatio || 1, w = cv.clientWidth;
@@ -178,48 +170,41 @@ function drawMap() {
   ctx.restore();
 }
 
-// ---------- strip charts ----------
-function drawChart(id, series, yLabelFmt, fixed) {
-  const [ctx, w, h] = sizeCanvas($(id), 110);
-  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, w, h);
-  if (!samples.length) return;
-  const tEnd = samples[samples.length - 1][0], tStart = tEnd - WINDOW_S;
-  const X = t => (t - tStart) / WINDOW_S * w;
-  // mode shading
-  let segStart = null, segMode = null;
-  const shade = (a, b, m) => { if (m === 3) { ctx.fillStyle = C.override + "22"; ctx.fillRect(X(a), 0, X(b) - X(a), h); } };
-  for (const s of samples) { if (s[4] !== segMode) { if (segMode !== null) shade(segStart, s[0], segMode); segStart = s[0]; segMode = s[4]; } }
-  shade(segStart, tEnd, segMode);
+// ---------- wheel ----------
+// Drawn at the angle the code is commanding (+ = clockwise/right, as seen from the driver).
+// The orange stripe is the 12 o'clock mark; the blue triangle outside the rim is where the
+// real wheel's 12 o'clock mark actually is (measured).
+function drawWheel() {
+  const cv = $("wheelviz"), w = cv.clientWidth;
+  const [ctx] = sizeCanvas(cv, w);
+  const cx = w / 2, cy = w / 2, R = w * 0.38, rad = d => d * Math.PI / 180;
+  const cmd = state?.target, meas = state?.wheel;
+  const active = cmd != null;
+  const deg = active ? cmd : (meas ?? 0);
 
-  let lo = Infinity, hi = -Infinity;
-  for (const sr of series) for (const s of samples) { const v = sr.get(s); if (v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v); } }
-  for (const v of fixed) if (v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
-  if (!isFinite(lo)) { lo = -1; hi = 1; }
-  const pad = Math.max((hi - lo) * 0.1, 1); lo -= pad; hi += pad;
-  const Y = v => h - (v - lo) / (hi - lo) * h;
-  ctx.strokeStyle = C.line; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(0, Y(0)); ctx.lineTo(w, Y(0)); ctx.stroke();
-  for (const sr of series) {
-    ctx.strokeStyle = sr.color; ctx.lineWidth = sr.width || 1.5; ctx.setLineDash(sr.dash || []); ctx.beginPath();
-    let pen = false;
-    for (const s of samples) { const v = sr.get(s); if (v == null) { pen = false; continue; }
-      pen ? ctx.lineTo(X(s[0]), Y(v)) : ctx.moveTo(X(s[0]), Y(v)); pen = true; }
-    ctx.stroke(); ctx.setLineDash([]);
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(rad(deg));
+  ctx.strokeStyle = active ? C.car : C.dim; ctx.lineCap = "round";
+  ctx.lineWidth = R * 0.07;                                  // spokes: 3, 6, 9 o'clock
+  for (const a of [0, 90, 180]) {
+    ctx.beginPath(); ctx.moveTo(Math.cos(rad(a)) * R * 0.22, Math.sin(rad(a)) * R * 0.22);
+    ctx.lineTo(Math.cos(rad(a)) * R, Math.sin(rad(a)) * R); ctx.stroke();
   }
-  ctx.fillStyle = C.dim; ctx.font = "10px ui-monospace, monospace";
-  ctx.fillText(yLabelFmt(hi), 4, 11); ctx.fillText(yLabelFmt(lo), 4, h - 3);
-}
+  ctx.lineWidth = R * 0.16; ctx.beginPath(); ctx.arc(0, 0, R, 0, 7); ctx.stroke();   // rim
+  ctx.fillStyle = active ? C.car : C.dim; ctx.beginPath(); ctx.arc(0, 0, R * 0.22, 0, 7); ctx.fill();
+  ctx.strokeStyle = C.override; ctx.lineCap = "butt";        // top-centre stripe
+  ctx.beginPath(); ctx.arc(0, 0, R, rad(-96), rad(-84)); ctx.stroke();
+  ctx.restore();
 
-function drawCharts() {
-  drawChart("angle", [
-    {get: s => s[2], color: C.path, dash: [4, 3]},
-    {get: s => s[1], color: C.car},
-  ], v => v.toFixed(0), []);
-  const en = state?.enter, ex = state?.exit;
-  const thr = [];
-  if (en != null) thr.push({get: () => en * 100, color: C.bad, width: 1}, {get: () => -en * 100, color: C.bad, width: 1});
-  if (ex != null) thr.push({get: () => ex * 100, color: C.goal, width: 1}, {get: () => -ex * 100, color: C.goal, width: 1});
-  drawChart("torque", [...thr, {get: s => s[3] * 100, color: C.override}], v => v.toFixed(1),
-            [en != null ? en * 130 : null, en != null ? -en * 130 : null]);
+  if (meas != null) {                                         // measured 12 o'clock marker
+    ctx.save(); ctx.translate(cx, cy); ctx.rotate(rad(meas));
+    ctx.fillStyle = C.path; ctx.beginPath();
+    ctx.moveTo(0, -R * 1.12); ctx.lineTo(-R * 0.07, -R * 1.28); ctx.lineTo(R * 0.07, -R * 1.28);
+    ctx.closePath(); ctx.fill(); ctx.restore();
+  }
+  const turns = d => d == null ? "" : ` (${(d / 360).toFixed(2)} turns)`;
+  $("wheeltext").innerHTML = active
+    ? `${f(cmd, 0, "°")}${turns(cmd)}<small>measured ${f(meas, 0, "°")} · diff ${f(meas - cmd, 0, "°")}</small>`
+    : `not driving<small>measured ${f(meas, 0, "°")}${turns(meas)}</small>`;
 }
 
 // ---------- panel ----------
@@ -238,9 +223,7 @@ function updatePanel() {
   $("wheel").textContent = f(s.wheel, 1, "°");
   $("target").textContent = f(s.target, 1, "°");
   $("vel").textContent = f(s.vel, 0, "°/s");
-  $("torque_v").textContent = f(s.torque * 100, 1, "%");
   $("tscale").textContent = f(s.torque_scale, 2);
-  $("overrides").textContent = s.overrides;
   $("planms").textContent = f(s.plan?.ms, 1, " ms");
   $("expanded").textContent = s.plan?.expanded ?? "—";
   $("pathn").textContent = path.length;
@@ -258,11 +241,6 @@ function connect() {
   es.onmessage = ev => {
     const m = JSON.parse(ev.data);
     if (m.path) path = m.path;
-    if (m.samples.length) {
-      samples.push(...m.samples);
-      const cut = samples[samples.length - 1][0] - WINDOW_S;
-      while (samples.length && samples[0][0] < cut) samples.shift();
-    }
     state = m.state;
     if (state.mode) {
       const last = trail[trail.length - 1];
@@ -274,7 +252,7 @@ function connect() {
     dirty = true;
   };
 }
-function frame() { if (dirty && map) { dirty = false; drawMap(); drawCharts(); } requestAnimationFrame(frame); }
+function frame() { if (dirty && map) { dirty = false; drawMap(); drawWheel(); } requestAnimationFrame(frame); }
 
 const send = body => fetch("/cmd", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
 $("map").addEventListener("click", e => {
