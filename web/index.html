@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wheel Autopilot</title>
+<style>
+  :root {
+    --bg: #111418; --panel: #1a1f26; --line: #2a313b; --text: #d8dee6; --dim: #8a94a3;
+    --wall: #4a5260; --infl: #1f252d; --path: #4da3ff; --car: #e8edf3;
+    --auto: #4da3ff; --override: #ff9f43; --plan: #b48cff; --idle: #8a94a3; --bad: #ff5c5c;
+    --goal: #3ddc84;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  header { display: flex; gap: 12px; align-items: center; padding: 8px 16px;
+           border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  #mode { font-weight: 700; padding: 2px 10px; border-radius: 4px; color: #111; background: var(--idle); }
+  #msg { color: var(--dim); flex: 1; min-width: 200px; }
+  #conn { color: var(--dim); }
+  button { background: var(--panel); color: var(--text); border: 1px solid var(--line);
+           border-radius: 4px; padding: 4px 12px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--dim); }
+  main { display: grid; grid-template-columns: 1fr 260px; gap: 12px; padding: 12px 16px; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+  canvas { display: block; width: 100%; background: var(--bg); border: 1px solid var(--line); border-radius: 4px; }
+  #map { cursor: crosshair; }
+  aside { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 10px 12px; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 2px 0; } td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  td:first-child { color: var(--dim); }
+  h3 { margin: 10px 0 4px; font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+  .hint { color: var(--dim); font-size: 11px; margin-top: 10px; }
+  .chart-label { color: var(--dim); font-size: 11px; margin: 8px 0 2px; }
+  .key { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin: 0 4px 0 10px; }
+</style>
+</head>
+<body>
+<header>
+  <span id="mode">—</span>
+  <span id="msg">connecting…</span>
+  <button id="stop">Stop (Space)</button>
+  <button id="reset">Reset car</button>
+  <span id="conn">●</span>
+</header>
+<main>
+  <div>
+    <canvas id="map"></canvas>
+    <div class="chart-label">wheel angle (deg)
+      <span class="key" style="background:var(--car)"></span>actual
+      <span class="key" style="background:var(--path)"></span>commanded</div>
+    <canvas id="angle" height="110"></canvas>
+    <div class="chart-label">human torque (% full scale)
+      <span class="key" style="background:var(--override)"></span>estimate
+      <span class="key" style="background:var(--bad)"></span>takeover
+      <span class="key" style="background:var(--goal)"></span>release</div>
+    <canvas id="torque" height="110"></canvas>
+  </div>
+  <aside>
+    <h3>Car</h3>
+    <table>
+      <tr><td>pose</td><td id="pose">—</td></tr>
+      <tr><td>speed</td><td id="speed">—</td></tr>
+      <tr><td>road steer</td><td id="steer">—</td></tr>
+      <tr><td>cross-track</td><td id="cte">—</td></tr>
+      <tr><td>remaining</td><td id="remaining">—</td></tr>
+      <tr><td>collision</td><td id="collision">—</td></tr>
+    </table>
+    <h3>Wheel</h3>
+    <table>
+      <tr><td>angle</td><td id="wheel">—</td></tr>
+      <tr><td>commanded</td><td id="target">—</td></tr>
+      <tr><td>velocity</td><td id="vel">—</td></tr>
+      <tr><td>human torque</td><td id="torque_v">—</td></tr>
+      <tr><td>motor scale</td><td id="tscale">—</td></tr>
+      <tr><td>overrides</td><td id="overrides">—</td></tr>
+    </table>
+    <h3>Planner</h3>
+    <table>
+      <tr><td>last plan</td><td id="planms">—</td></tr>
+      <tr><td>expanded</td><td id="expanded">—</td></tr>
+      <tr><td>path pts</td><td id="pathn">—</td></tr>
+    </table>
+    <h3>Timing (worst, last 1 s)</h3>
+    <table>
+      <tr><td>wheel loop</td><td id="wdt">—</td></tr>
+      <tr><td>control loop</td><td id="ldt">—</td></tr>
+    </table>
+    <div class="hint">click: set goal<br>shift+click: move car (idle)<br>
+      wheel loop should stay near 2 ms; spikes &gt;10 ms mean Python is too jittery.</div>
+  </aside>
+</main>
+<script>
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const C = {}; for (const k of ["bg","line","text","dim","wall","infl","path","car","auto","override","plan","idle","bad","goal"]) C[k] = css("--" + k);
+const MODE_COLOR = {IDLE: C.idle, PLANNING: C.plan, AUTO: C.auto, OVERRIDE: C.override, REPLANNING: C.plan};
+const MODE_BY_CODE = ["IDLE","PLANNING","AUTO","OVERRIDE","REPLANNING"];
+const $ = id => document.getElementById(id);
+
+let map = null, mapImg = null, path = [], state = null, trail = [], samples = [];
+const WINDOW_S = 15;
+
+function sizeCanvas(cv, cssH) {
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth;
+  const h = cssH ?? cv.clientHeight;
+  cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); cv.style.height = h + "px";
+  const ctx = cv.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return [ctx, w, h];
+}
+
+// ---------- map ----------
+function scale() { return $("map").clientWidth / (map.cols * map.res); }
+function toScreen(x, y) { const s = scale(); return [x * s, (map.rows * map.res - y) * s]; }
+function toWorld(px, py) { const s = scale(); return [px / s, map.rows * map.res - py / s]; }
+
+function buildMapImage() {
+  const cv = document.createElement("canvas"); cv.width = map.cols; cv.height = map.rows;
+  const ctx = cv.getContext("2d");
+  for (let r = 0; r < map.rows; r++) for (let c = 0; c < map.cols; c++) {
+    const wall = map.occ[r][c] === "#", infl = map.inflated[r][c] === "#";
+    if (wall) { ctx.fillStyle = C.wall; ctx.fillRect(c, r, 1, 1); }
+    else if (infl) { ctx.fillStyle = C.infl; ctx.fillRect(c, r, 1, 1); }
+  }
+  mapImg = cv;
+}
+
+function drawMap() {
+  if (!map) return;
+  const cv = $("map");
+  const w = cv.clientWidth, h = w * map.rows / map.cols;
+  const [ctx] = sizeCanvas(cv, h);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(mapImg, 0, 0, w, h);
+  const s = scale();
+
+  // grid every 5 m
+  ctx.strokeStyle = C.line; ctx.lineWidth = 0.5; ctx.beginPath();
+  for (let x = 0; x <= map.cols * map.res; x += 5) { const [px] = toScreen(x, 0); ctx.moveTo(px, 0); ctx.lineTo(px, h); }
+  for (let y = 0; y <= map.rows * map.res; y += 5) { const [, py] = toScreen(0, y); ctx.moveTo(0, py); ctx.lineTo(w, py); }
+  ctx.stroke();
+
+  // path
+  if (path.length > 1) {
+    ctx.strokeStyle = C.path; ctx.lineWidth = 2; ctx.setLineDash([6, 4]); ctx.beginPath();
+    path.forEach(([x, y], i) => { const [px, py] = toScreen(x, y); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); });
+    ctx.stroke(); ctx.setLineDash([]);
+  }
+  // trail, coloured by mode
+  for (let i = 1; i < trail.length; i++) {
+    const [x0, y0] = trail[i - 1], [x1, y1, m] = trail[i];
+    ctx.strokeStyle = MODE_COLOR[m] || C.idle; ctx.lineWidth = 2; ctx.beginPath();
+    ctx.moveTo(...toScreen(x0, y0)); ctx.lineTo(...toScreen(x1, y1)); ctx.stroke();
+  }
+  if (!state) return;
+  // goal
+  if (state.goal) {
+    const [gx, gy] = toScreen(...state.goal);
+    ctx.strokeStyle = C.goal; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(gx, gy, 6, 0, 7); ctx.stroke();
+    ctx.beginPath(); ctx.arc(gx, gy, 2, 0, 7); ctx.fillStyle = C.goal; ctx.fill();
+  }
+  // lookahead
+  if (state.lookahead_pt) {
+    const [cx, cy] = toScreen(state.x, state.y), [lx, ly] = toScreen(...state.lookahead_pt);
+    ctx.strokeStyle = C.auto; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(lx, ly); ctx.stroke();
+    ctx.fillStyle = C.auto; ctx.beginPath(); ctx.arc(lx, ly, 4, 0, 7); ctx.fill();
+  }
+  // car: 4.5 x 1.8 m body, pose = rear axle
+  const [cx, cy] = toScreen(state.x, state.y);
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(-state.yaw); ctx.scale(s, s);
+  ctx.fillStyle = state.collision ? C.bad : (MODE_COLOR[state.mode] || C.car);
+  ctx.globalAlpha = 0.85; ctx.fillRect(-0.9, -0.9, 4.5, 1.8); ctx.globalAlpha = 1;
+  ctx.strokeStyle = C.car; ctx.lineWidth = 0.12;
+  for (const side of [-0.75, 0.75]) {        // front wheels at wheelbase 2.7 m
+    ctx.save(); ctx.translate(2.7, side); ctx.rotate(-state.steer);
+    ctx.beginPath(); ctx.moveTo(-0.35, 0); ctx.lineTo(0.35, 0); ctx.stroke(); ctx.restore();
+  }
+  ctx.restore();
+}
+
+// ---------- strip charts ----------
+function drawChart(id, series, yLabelFmt, fixed) {
+  const [ctx, w, h] = sizeCanvas($(id), 110);
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, w, h);
+  if (!samples.length) return;
+  const tEnd = samples[samples.length - 1][0], tStart = tEnd - WINDOW_S;
+  const X = t => (t - tStart) / WINDOW_S * w;
+  // mode shading
+  let segStart = null, segMode = null;
+  const shade = (a, b, m) => { if (m === 3) { ctx.fillStyle = C.override + "22"; ctx.fillRect(X(a), 0, X(b) - X(a), h); } };
+  for (const s of samples) { if (s[4] !== segMode) { if (segMode !== null) shade(segStart, s[0], segMode); segStart = s[0]; segMode = s[4]; } }
+  shade(segStart, tEnd, segMode);
+
+  let lo = Infinity, hi = -Infinity;
+  for (const sr of series) for (const s of samples) { const v = sr.get(s); if (v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v); } }
+  for (const v of fixed) if (v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  if (!isFinite(lo)) { lo = -1; hi = 1; }
+  const pad = Math.max((hi - lo) * 0.1, 1); lo -= pad; hi += pad;
+  const Y = v => h - (v - lo) / (hi - lo) * h;
+  ctx.strokeStyle = C.line; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(0, Y(0)); ctx.lineTo(w, Y(0)); ctx.stroke();
+  for (const sr of series) {
+    ctx.strokeStyle = sr.color; ctx.lineWidth = sr.width || 1.5; ctx.setLineDash(sr.dash || []); ctx.beginPath();
+    let pen = false;
+    for (const s of samples) { const v = sr.get(s); if (v == null) { pen = false; continue; }
+      pen ? ctx.lineTo(X(s[0]), Y(v)) : ctx.moveTo(X(s[0]), Y(v)); pen = true; }
+    ctx.stroke(); ctx.setLineDash([]);
+  }
+  ctx.fillStyle = C.dim; ctx.font = "10px ui-monospace, monospace";
+  ctx.fillText(yLabelFmt(hi), 4, 11); ctx.fillText(yLabelFmt(lo), 4, h - 3);
+}
+
+function drawCharts() {
+  drawChart("angle", [
+    {get: s => s[2], color: C.path, dash: [4, 3]},
+    {get: s => s[1], color: C.car},
+  ], v => v.toFixed(0), []);
+  const en = state?.enter, ex = state?.exit;
+  const thr = [];
+  if (en != null) thr.push({get: () => en * 100, color: C.bad, width: 1}, {get: () => -en * 100, color: C.bad, width: 1});
+  if (ex != null) thr.push({get: () => ex * 100, color: C.goal, width: 1}, {get: () => -ex * 100, color: C.goal, width: 1});
+  drawChart("torque", [...thr, {get: s => s[3] * 100, color: C.override}], v => v.toFixed(1),
+            [en != null ? en * 130 : null, en != null ? -en * 130 : null]);
+}
+
+// ---------- panel ----------
+const f = (v, d = 1, u = "") => v == null ? "—" : Number(v).toFixed(d) + u;
+function updatePanel() {
+  const s = state;
+  $("mode").textContent = s.mode; $("mode").style.background = MODE_COLOR[s.mode];
+  $("msg").textContent = s.msg;
+  $("pose").textContent = `${f(s.x)}, ${f(s.y)} @ ${f(s.yaw * 180 / Math.PI, 0)}°`;
+  $("speed").textContent = f(s.speed, 1, " m/s");
+  $("steer").textContent = f(s.steer * 180 / Math.PI, 1, "°");
+  $("cte").textContent = f(s.cte, 2, " m");
+  $("remaining").textContent = f(s.remaining, 1, " m");
+  $("collision").textContent = s.collision ? "YES" : "no";
+  $("collision").style.color = s.collision ? C.bad : "";
+  $("wheel").textContent = f(s.wheel, 1, "°");
+  $("target").textContent = f(s.target, 1, "°");
+  $("vel").textContent = f(s.vel, 0, "°/s");
+  $("torque_v").textContent = f(s.torque * 100, 1, "%");
+  $("tscale").textContent = f(s.torque_scale, 2);
+  $("overrides").textContent = s.overrides;
+  $("planms").textContent = f(s.plan?.ms, 1, " ms");
+  $("expanded").textContent = s.plan?.expanded ?? "—";
+  $("pathn").textContent = path.length;
+  $("wdt").textContent = f(s.wheel_dt_ms, 2, " ms");
+  $("wdt").style.color = s.wheel_dt_ms > 10 ? C.bad : "";
+  $("ldt").textContent = f(s.loop_dt_ms, 1, " ms");
+}
+
+// ---------- data ----------
+let dirty = false;
+function connect() {
+  const es = new EventSource("/events");
+  es.onopen = () => { $("conn").style.color = C.goal; };
+  es.onerror = () => { $("conn").style.color = C.bad; };
+  es.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.path) path = m.path;
+    if (m.samples.length) {
+      samples.push(...m.samples);
+      const cut = samples[samples.length - 1][0] - WINDOW_S;
+      while (samples.length && samples[0][0] < cut) samples.shift();
+    }
+    state = m.state;
+    if (state.mode) {
+      const last = trail[trail.length - 1];
+      if (!last || Math.hypot(last[0] - state.x, last[1] - state.y) > 0.2) trail.push([state.x, state.y, state.mode]);
+      if (Math.hypot((last?.[0] ?? state.x) - state.x, (last?.[1] ?? state.y) - state.y) > 5) trail = [[state.x, state.y, state.mode]];
+      if (trail.length > 3000) trail.shift();
+      updatePanel();
+    }
+    dirty = true;
+  };
+}
+function frame() { if (dirty && map) { dirty = false; drawMap(); drawCharts(); } requestAnimationFrame(frame); }
+
+const send = body => fetch("/cmd", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+$("map").addEventListener("click", e => {
+  if (!map) return;
+  const r = $("map").getBoundingClientRect();
+  const [x, y] = toWorld(e.clientX - r.left, e.clientY - r.top);
+  send(e.shiftKey ? {cmd: "pose", x, y} : {cmd: "goal", x, y});
+});
+$("stop").onclick = () => send({cmd: "stop"});
+$("reset").onclick = () => { trail = []; send({cmd: "reset"}); };
+addEventListener("keydown", e => { if (e.code === "Space") { e.preventDefault(); send({cmd: "stop"}); } });
+addEventListener("resize", () => { dirty = true; });
+
+fetch("/map").then(r => r.json()).then(m => { map = m; buildMapImage(); dirty = true; });
+connect(); requestAnimationFrame(frame);
+</script>
+</body>
+</html>

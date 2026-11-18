@@ -81,6 +81,12 @@ class WheelController:
         self.human_torque = 0.0               # estimated human torque, + = toward the right
         self._log = None                      # set to a list to record (t, pos, vel, motor)
 
+        # Dead-man: if set, fall back to "free" when goto()/torque() hasn't been called for
+        # this many seconds (e.g. the code commanding the wheel hung or crashed).
+        self.watchdog_s = None
+        self._last_cmd = time.monotonic()
+        self._loop_dt_max = 0.0               # worst control-loop period since last pop
+
         # Full device gain, disable built-in autocenter so it doesn't fight us.
         try:
             dev.write(ecodes.EV_FF, ecodes.FF_GAIN, 0xFFFF)
@@ -124,11 +130,18 @@ class WheelController:
         with self._lock:
             self._target_deg = max(-lim, min(lim, deg))
             self._mode = "position"
+            self._last_cmd = time.monotonic()
 
     def torque(self, value):
         with self._lock:
             self._torque_cmd = value
             self._mode = "torque"
+            self._last_cmd = time.monotonic()
+
+    def pop_loop_dt_max(self):
+        """Worst control-loop period (s) since the last call. ~0.002 at 500 Hz is healthy."""
+        v, self._loop_dt_max = self._loop_dt_max, 0.0
+        return v
 
     def release(self):
         with self._lock:
@@ -175,8 +188,13 @@ class WheelController:
             # low-pass filtered velocity (deg/s) for the damping term
             vel = 0.7 * vel + 0.3 * ((pos - prev) / dt)
             prev, prev_t = pos, now
+            if dt > self._loop_dt_max:
+                self._loop_dt_max = dt
 
             with self._lock:
+                if (self.watchdog_s and self._mode != "free"
+                        and now - self._last_cmd > self.watchdog_s):
+                    self._mode = "free"
                 mode, target, tcmd = self._mode, self._target_deg, self._torque_cmd
 
             if mode == "position":
