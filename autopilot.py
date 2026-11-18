@@ -43,6 +43,7 @@ from planner import GridMap, init_worker, plan_path
 from tracker import PurePursuit, SlewLimiter
 from vehicle import Bicycle, Pose, Steering
 
+LOCK_MIN = 90.0                                  # most sensitive: full lock at 90 deg
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_FILE = os.path.join(HERE, "moza_model.json")
 DRIVING = ("AUTO", "OVERRIDE", "REPLANNING")
@@ -55,7 +56,8 @@ class Autopilot:
         self.ctl, self.grid, self.plan_grid = ctl, grid, plan_grid
         self.cfg, self.hub, self.pool, self.detector = cfg, hub, pool, detector
         self.full_torque = ctl.max_torque
-        lock = min(cfg.wheel_lock, ctl.rotation / 2.0)
+        self.lock_max = ctl.rotation / 2.0           # can't steer past the Boxflat range
+        lock = min(cfg.wheel_lock, self.lock_max)
         if lock < cfg.wheel_lock:
             print(f"--wheel-lock {cfg.wheel_lock:.0f} exceeds the Boxflat range; using {lock:.0f}")
         self.steering = Steering(2.0 * lock, cfg.max_steer)
@@ -115,6 +117,15 @@ class Autopilot:
 
     def _request_plan(self):
         self._future = self.pool.submit(plan_path, (self.pose.x, self.pose.y), self.goal)
+
+    def set_wheel_lock(self, deg):
+        """Change steering sensitivity live: wheel degrees each way for full road-wheel lock."""
+        if not math.isfinite(deg):
+            return
+        deg = max(LOCK_MIN, min(self.lock_max, deg))
+        self.steering = Steering(2.0 * deg, self.cfg.max_steer)
+        self.manual_deg = max(-deg, min(deg, self.manual_deg))
+        self.msg = f"steering ratio {self.steering.ratio:.1f}:1 (full lock at {deg:.0f} deg)"
 
     def _start_wheel(self):
         """Hand the wheel to the motor gently: start from where it is, ramp torque up."""
@@ -203,6 +214,8 @@ class Autopilot:
                     v = float(c["v"])
                     if math.isfinite(v):
                         self.manual_speed = max(0.0, min(2.0 * self.cfg.speed + 2.0, v))
+                elif kind == "lock":
+                    self.set_wheel_lock(float(c["deg"]))
                 elif kind == "reset":
                     self.stop("reset")
                     self.pose = Pose(**vars(self.start_pose))
@@ -279,6 +292,8 @@ class Autopilot:
             "yaw": round(self.pose.yaw, 4), "steer": round(steer_actual, 4),
             "speed": speed, "wheel": round(angle, 1),
             "wheel_limit": self.steering.wheel_limit, "manual_speed": self.manual_speed,
+            "ratio": round(self.steering.ratio, 2), "lock_min": LOCK_MIN,
+            "lock_max": self.lock_max,
             "target": None if target is None else round(target, 1),
             "vel": round(vel, 1), "torque": round(d.filtered, 4),
             "enter": d.torque_enter, "exit": d.torque_exit,
