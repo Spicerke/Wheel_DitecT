@@ -21,6 +21,7 @@ the human's hand while the motor is driving):
   python3 autopilot.py --go                  # immediately drive to the map's G
 
 UI: click = set goal, shift+click = move car (when idle), Space = stop.
+    Manual button: drag the wheel picture (or arrow keys) to steer; up/down = speed.
 
 SAFETY: the wheel will turn by itself. Start with a low --max-torque.
 """
@@ -45,7 +46,8 @@ from vehicle import Bicycle, Pose, Steering
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_FILE = os.path.join(HERE, "moza_model.json")
 DRIVING = ("AUTO", "OVERRIDE", "REPLANNING")
-MODE_CODE = {"IDLE": 0, "PLANNING": 1, "AUTO": 2, "OVERRIDE": 3, "REPLANNING": 4}
+MODE_CODE = {"IDLE": 0, "PLANNING": 1, "AUTO": 2, "OVERRIDE": 3, "REPLANNING": 4,
+             "CENTERING": 5, "MANUAL": 6}
 
 
 class Autopilot:
@@ -53,7 +55,10 @@ class Autopilot:
         self.ctl, self.grid, self.plan_grid = ctl, grid, plan_grid
         self.cfg, self.hub, self.pool, self.detector = cfg, hub, pool, detector
         self.full_torque = ctl.max_torque
-        self.steering = Steering(ctl.rotation, cfg.max_steer)
+        lock = min(cfg.wheel_lock, ctl.rotation / 2.0)
+        if lock < cfg.wheel_lock:
+            print(f"--wheel-lock {cfg.wheel_lock:.0f} exceeds the Boxflat range; using {lock:.0f}")
+        self.steering = Steering(2.0 * lock, cfg.max_steer)
         self.car = Bicycle(cfg.wheelbase)
         sx, sy = grid.start or (grid.cols * grid.res / 2, grid.rows * grid.res / 2)
         self.start_pose = Pose(sx, sy, math.radians(cfg.start_yaw))
@@ -74,6 +79,8 @@ class Autopilot:
         self._timing = (0.0, 0.0)
         self._timing_t = 0.0
         self.log = None                              # csv.writer, set by main()
+        self.manual_deg = 0.0                        # UI-commanded wheel angle in MANUAL
+        self.manual_speed = cfg.speed
 
     # ---------- state changes ----------
     def _set(self, state, msg=None):
@@ -99,20 +106,56 @@ class Autopilot:
             self.msg = "new goal; will plan when you let go"
             return
         self._request_plan()
+        if self.state in ("CENTERING", "MANUAL"):
+            self.ctl.release()
+            self.ctl.max_torque = self.full_torque
+            self._set("IDLE")
         if self.state == "IDLE":
             self._set("PLANNING", "planning")
 
     def _request_plan(self):
         self._future = self.pool.submit(plan_path, (self.pose.x, self.pose.y), self.goal)
 
-    def _engage(self):
+    def _start_wheel(self):
         """Hand the wheel to the motor gently: start from where it is, ramp torque up."""
         self.slew.reset(self.ctl.angle())
         self.ctl.max_torque = 0.0
         self._ramp_done = False
         self.ctl.goto(self.slew.value)
+
+    def _drive_wheel(self, desired, angle, dt):
+        """Slew toward `desired` wheel deg and send it. Returns the commanded angle."""
+        lim = self.steering.wheel_limit
+        target = self.slew.step(max(-lim, min(lim, desired)), dt)
+        if not self._ramp_done:
+            # Motor is still weak: keep the command on a short leash to the wheel so lag
+            # can't pile up and get released as a lunge (or a false takeover).
+            target = max(angle - 20.0, min(angle + 20.0, target))
+            self.slew.reset(target)
+            self.ctl.max_torque = min(self.full_torque, self.ctl.max_torque
+                                      + self.full_torque * dt / self.cfg.ramp)
+            self._ramp_done = self.ctl.max_torque >= self.full_torque
+        self.ctl.goto(target)
+        return target
+
+    def _center(self):
+        """Drive the wheel back to 0 deg, then release it - see step()."""
+        self._start_wheel()
+        self._centered_t = 0.0
+        self._set("CENTERING", "centering wheel")
+
+    def _engage(self):
+        self._start_wheel()
         self.detector.reset()
         self._set("AUTO", "following path")
+
+    def _manual(self):
+        """UI drives the wheel picture; the motor turns the real wheel to match."""
+        self._future = None
+        lim = self.steering.wheel_limit
+        self.manual_deg = max(-lim, min(lim, self.ctl.angle()))
+        self._start_wheel()
+        self._set("MANUAL", "manual: drag the wheel / arrow keys to steer")
 
     def _poll_plan(self):
         f = self._future
@@ -149,9 +192,21 @@ class Autopilot:
                 elif kind == "pose" and self.state == "IDLE":
                     self.pose = Pose(float(c["x"]), float(c["y"]),
                                      float(c.get("yaw", self.pose.yaw)))
+                elif kind == "manual":
+                    if self.state != "MANUAL":
+                        self._manual()
+                elif kind == "steer" and self.state == "MANUAL":
+                    d = float(c["deg"])
+                    if math.isfinite(d):
+                        self.manual_deg = d
+                elif kind == "speed":
+                    v = float(c["v"])
+                    if math.isfinite(v):
+                        self.manual_speed = max(0.0, min(2.0 * self.cfg.speed + 2.0, v))
                 elif kind == "reset":
                     self.stop("reset")
                     self.pose = Pose(**vars(self.start_pose))
+                    self._center()
             except (KeyError, TypeError, ValueError):
                 self.msg = f"bad command: {c!r}"[:120]
 
@@ -177,17 +232,7 @@ class Autopilot:
                 if self.info["remaining"] < self.cfg.goal_tol:
                     self.stop("arrived")
                 else:
-                    target = self.slew.step(self.steering.steer_to_wheel(steer), dt)
-                    if not self._ramp_done:
-                        # Motor is still weak: keep the command on a short leash to the wheel
-                        # so lag can't pile up and get released as a lunge (or a false takeover).
-                        target = max(angle - 20.0, min(angle + 20.0, target))
-                        self.slew.reset(target)
-                    ctl.goto(target)
-                    if not self._ramp_done:
-                        ctl.max_torque = min(self.full_torque, ctl.max_torque
-                                             + self.full_torque * dt / self.cfg.ramp)
-                        self._ramp_done = ctl.max_torque >= self.full_torque
+                    target = self._drive_wheel(self.steering.steer_to_wheel(steer), angle, dt)
         elif self.state == "OVERRIDE":
             if self.goal and self._future is None and self.detector.released(ht, vel, dt):
                 self.detector.reset()
@@ -195,9 +240,20 @@ class Autopilot:
                 self._set("REPLANNING", "you let go; replanning from here")
         elif self.state == "REPLANNING":
             self.detector.released(ht, vel, dt)       # keep the filter warm
+        elif self.state == "MANUAL":
+            target = self._drive_wheel(self.manual_deg, angle, dt)
+        elif self.state == "CENTERING":
+            target = self._drive_wheel(0.0, angle, dt)
+            settled = abs(angle) < 2.0 and abs(vel) < 10.0
+            self._centered_t = self._centered_t + dt if settled else 0.0
+            if self._centered_t > 0.3:
+                self.stop("wheel centered")
 
         # simulated car always steers with the physical wheel
-        speed = self.cfg.speed if self.state in DRIVING else 0.0
+        if self.state == "MANUAL":
+            speed = self.manual_speed
+        else:
+            speed = self.cfg.speed if self.state in DRIVING else 0.0
         steer_actual = self.steering.wheel_to_steer(angle)
         self.pose = self.car.step(self.pose, speed, steer_actual, dt)
         self.collision = self.grid.blocked(self.pose.x, self.pose.y)
@@ -222,6 +278,7 @@ class Autopilot:
             "x": round(self.pose.x, 3), "y": round(self.pose.y, 3),
             "yaw": round(self.pose.yaw, 4), "steer": round(steer_actual, 4),
             "speed": speed, "wheel": round(angle, 1),
+            "wheel_limit": self.steering.wheel_limit, "manual_speed": self.manual_speed,
             "target": None if target is None else round(target, 1),
             "vel": round(vel, 1), "torque": round(d.filtered, 4),
             "enter": d.torque_enter, "exit": d.torque_exit,
@@ -273,6 +330,8 @@ def main():
     a("--speed", type=float, default=2.0, help="car speed, m/s")
     a("--wheelbase", type=float, default=2.7)
     a("--max-steer", type=float, default=30.0, help="road-wheel lock, deg")
+    a("--wheel-lock", type=float, default=360.0,
+      help="steering-wheel angle each way at full road-wheel lock, deg (sets the ratio)")
     a("--lookahead", type=float, default=4.0, help="min pure-pursuit lookahead, m")
     a("--lookahead-gain", type=float, default=1.0, help="lookahead per m/s")
     a("--goal-tol", type=float, default=1.0, help="arrival radius, m")

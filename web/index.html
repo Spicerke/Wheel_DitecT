@@ -32,7 +32,11 @@
   td:first-child { color: var(--dim); }
   h3 { margin: 10px 0 4px; font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
   .hint { color: var(--dim); font-size: 11px; margin-top: 10px; }
-  #wheelviz { width: 100%; aspect-ratio: 1; border: none; }
+  #wheelviz { width: 100%; aspect-ratio: 1; border: none; touch-action: none; }
+  #wheelviz.grab { cursor: grab; } #wheelviz.grab:active { cursor: grabbing; }
+  #manualctl { display: flex; gap: 8px; align-items: center; justify-content: center; margin-bottom: 6px; }
+  #manualctl[hidden] { display: none; }
+  #mspeed { width: 120px; }
   #wheeltext { text-align: center; font-size: 15px; margin: 2px 0 6px; font-variant-numeric: tabular-nums; }
   #wheeltext small { display: block; color: var(--dim); font-size: 11px; }
 </style>
@@ -43,6 +47,7 @@
   <span id="msg">connecting…</span>
   <button id="stop">Stop (Space)</button>
   <button id="reset">Reset car</button>
+  <button id="manual">Manual</button>
   <span id="conn">●</span>
 </header>
 <main>
@@ -53,6 +58,10 @@
     <h3>Wheel (commanded)</h3>
     <canvas id="wheelviz"></canvas>
     <div id="wheeltext"></div>
+    <div id="manualctl" hidden>
+      <label>speed <input id="mspeed" type="range" min="0" max="6" step="0.5"></label>
+      <span id="mspeedv"></span>
+    </div>
     <h3>Car</h3>
     <table>
       <tr><td>pose</td><td id="pose">—</td></tr>
@@ -81,13 +90,14 @@
       <tr><td>control loop</td><td id="ldt">—</td></tr>
     </table>
     <div class="hint">click: set goal<br>shift+click: move car (idle)<br>
+      Manual: drag wheel or ←/→ to steer, ↑/↓ speed<br>
       wheel loop should stay near 2 ms; spikes &gt;10 ms mean Python is too jittery.</div>
   </aside>
 </main>
 <script>
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const C = {}; for (const k of ["bg","line","text","dim","wall","infl","path","car","auto","override","plan","idle","bad","goal"]) C[k] = css("--" + k);
-const MODE_COLOR = {IDLE: C.idle, PLANNING: C.plan, AUTO: C.auto, OVERRIDE: C.override, REPLANNING: C.plan};
+const MODE_COLOR = {IDLE: C.idle, PLANNING: C.plan, AUTO: C.auto, OVERRIDE: C.override, REPLANNING: C.plan, CENTERING: C.goal, MANUAL: C.override};
 const MODE_BY_CODE = ["IDLE","PLANNING","AUTO","OVERRIDE","REPLANNING"];
 const $ = id => document.getElementById(id);
 
@@ -178,7 +188,7 @@ function drawWheel() {
   const cv = $("wheelviz"), w = cv.clientWidth;
   const [ctx] = sizeCanvas(cv, w);
   const cx = w / 2, cy = w / 2, R = w * 0.38, rad = d => d * Math.PI / 180;
-  const cmd = state?.target, meas = state?.wheel;
+  const cmd = isManual() ? manualDeg : state?.target, meas = state?.wheel;
   const active = cmd != null;
   const deg = active ? cmd : (meas ?? 0);
 
@@ -211,6 +221,14 @@ function drawWheel() {
 const f = (v, d = 1, u = "") => v == null ? "—" : Number(v).toFixed(d) + u;
 function updatePanel() {
   const s = state;
+  if (s.mode === "MANUAL" && prevMode !== "MANUAL") {      // entering manual: start from real wheel
+    manualDeg = Math.max(-s.wheel_limit, Math.min(s.wheel_limit, s.wheel));
+    $("mspeed").value = s.manual_speed;
+  }
+  prevMode = s.mode;
+  $("manualctl").hidden = s.mode !== "MANUAL";
+  $("wheelviz").classList.toggle("grab", s.mode === "MANUAL");
+  $("mspeedv").textContent = f(s.manual_speed, 1, " m/s");
   $("mode").textContent = s.mode; $("mode").style.background = MODE_COLOR[s.mode];
   $("msg").textContent = s.msg;
   $("pose").textContent = `${f(s.x)}, ${f(s.y)} @ ${f(s.yaw * 180 / Math.PI, 0)}°`;
@@ -262,8 +280,48 @@ $("map").addEventListener("click", e => {
   send(e.shiftKey ? {cmd: "pose", x, y} : {cmd: "goal", x, y});
 });
 $("stop").onclick = () => send({cmd: "stop"});
+$("manual").onclick = () => send({cmd: "manual"});
+
+// ---------- manual driving ----------
+let manualDeg = 0, prevMode = null, dragging = false, lastPtrAng = 0, lastSent = 0, pendingSteer = null;
+function isManual() { return state?.mode === "MANUAL"; }
+function flushSteer() {
+  if (pendingSteer == null) return;
+  const wait = 50 - (performance.now() - lastSent);      // at most ~20 steer msgs/s
+  if (wait > 0) { setTimeout(flushSteer, wait); return; }
+  lastSent = performance.now();
+  send({cmd: "steer", deg: pendingSteer}); pendingSteer = null;
+}
+function steerTo(d) {
+  const lim = state?.wheel_limit ?? 360;
+  manualDeg = Math.max(-lim, Math.min(lim, d));
+  pendingSteer = manualDeg; flushSteer(); dirty = true;
+}
+function setSpeed(v) { v = Math.max(0, Math.min(6, v)); $("mspeed").value = v; send({cmd: "speed", v}); }
+const wv = $("wheelviz");
+const ptrAng = e => { const r = wv.getBoundingClientRect();
+  return Math.atan2(e.clientY - r.top - r.height / 2, e.clientX - r.left - r.width / 2) * 180 / Math.PI; };
+wv.addEventListener("pointerdown", e => {
+  if (!isManual()) return;
+  dragging = true; lastPtrAng = ptrAng(e); wv.setPointerCapture(e.pointerId);
+});
+wv.addEventListener("pointermove", e => {
+  if (!dragging) return;
+  const a = ptrAng(e); let d = a - lastPtrAng;            // unwrap so you can spin past 180
+  if (d > 180) d -= 360; if (d < -180) d += 360;
+  lastPtrAng = a; steerTo(manualDeg + d);
+});
+for (const ev of ["pointerup", "pointercancel"]) wv.addEventListener(ev, () => { dragging = false; });
+$("mspeed").addEventListener("input", e => setSpeed(Number(e.target.value)));
 $("reset").onclick = () => { trail = []; send({cmd: "reset"}); };
-addEventListener("keydown", e => { if (e.code === "Space") { e.preventDefault(); send({cmd: "stop"}); } });
+addEventListener("keydown", e => {
+  if (e.code === "Space") { e.preventDefault(); send({cmd: "stop"}); return; }
+  if (!isManual() || e.target.tagName === "INPUT") return;
+  const k = {ArrowLeft: () => steerTo(manualDeg - 15), ArrowRight: () => steerTo(manualDeg + 15),
+             ArrowUp: () => setSpeed(Number($("mspeed").value) + 0.5),
+             ArrowDown: () => setSpeed(Number($("mspeed").value) - 0.5)}[e.code];
+  if (k) { e.preventDefault(); k(); }
+});
 addEventListener("resize", () => { dirty = true; });
 
 fetch("/map").then(r => r.json()).then(m => { map = m; buildMapImage(); dirty = true; });
